@@ -1,0 +1,508 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <HX711.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <esp_sleep.h> // Include the library for ESP32 sleep functions
+//#include <RTCData.h> // Manesh - Added to use RTC memory
+
+const int LOADCELL_DOUT_PIN = 5;
+const int LOADCELL_SCK_PIN = 18;
+
+const float gbl_known_mass = 78;
+const char *gbl_device_id = "65b70c49e00eb99161de1ba5";
+
+const int email_notifi_count = 3;
+const int email_msg_count = 15;
+bool refillStatus = true;
+
+HX711 scale;
+
+unsigned int sendDataCounter = 0;
+
+// -----------Constants-----------
+
+const char *ssidList[] = {"XPACPRODUCTION", "SINGTEL-YXW9"};
+const char *passwordList[] = {"goXpacToNET888", "xcumvm92v6"};
+
+const int numNetworks = 2; // Number of networks to tr
+
+
+// Wifi connection
+const char *ssid = "";
+const char *password = "";
+
+// Analog pin connected to the battery through a voltage divider
+const int batteryPin = 34;
+
+// Battery voltages
+const float minVoltage = 3.3;
+const float maxVoltage = 4.1;
+
+// LCD display I2C
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// Server base url
+// const char *serverUrl = "https://local-server-3igv.onrender.com/api/";
+const char *serverUrl = "http://104.245.34.253:3300/api/";
+const float unitPlaced = 0;
+const float weigthPlace = 0;
+
+// Manesh, sets variables for deepsleep and tracking of init status
+//RTC_DATA_ATTR float calibration_factor;
+
+RTC_DATA_ATTR bool scaleCalib = false; //RTC memory use for holding initialize flag
+#define uS_TO_S_FACTOR 1000000 // COnvertion factor for microseconds to seconds
+
+//const int sleepTimeSeconds = 2 * 60 * 60; // Change this for DeepSleep time
+
+
+const int sleepTimeHours = 2; // 2 hours sleep time
+const int sleepTimeMicroseconds = sleepTimeHours * 3600 * uS_TO_S_FACTOR; // Convert 2 hours to microseconds
+
+const int dishWeight = -83; // Change this for scale weight
+
+const int countAdjustment = 2; // Change this based on the additional value shows after deep sleep
+
+
+void setup()
+{
+    Serial.begin(57600);
+
+    // Intialize the LCD communication
+    lcd.init();
+    lcd.backlight();
+
+    // Initialize the wifi connection (comment here for wifi)
+   // connectToWiFi(); 
+
+    Serial.print("Connected to WiFi");
+    lcd.print("Connected to WiFi");
+
+    Serial.println("place the cardbrd ");
+
+    scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+
+  
+	// Manesh moved the scale init codes to a new function initScale()
+	
+	 Serial.println("Current value for scaleCalib = ");
+	 Serial.println(scaleCalib);
+	
+	//Use scaleCalib value and decide to call scale initializing
+	if(!scaleCalib){
+		Serial.println(" xxxxxxxxxxxxx First time running, calling Scale Init xxxxxxxxxxxxxxxxxx");
+		initScale();
+		scaleCalib = true;  // Setting RTC memory
+	}else
+   {
+		Serial.println(" !!!!!!! No need to Init Scale !!!!!!!!!!!!");
+    scale.set_scale(dishWeight);
+	}
+  
+  //Serial.print("Scale calibration factor: ");
+  //  Serial.println(calibration_factor);
+
+}
+
+void loop()
+{
+	//Main logic is active. This will be repeated every time system is up
+	
+	Serial.println(" ");
+	Serial.println("......... Executing Loop ......");
+
+	// Call function that sets data and handle sending.
+	updateScaleData();
+	
+	//Now ready to go for deep sleep to save data
+	esp_sleep_enable_timer_wakeup(sleepTimeMicroseconds);
+	 
+	Serial.println(" ");
+	Serial.println("......... zzzz Deep Sleep Start zzzz ......");
+	
+	//Start deep sleep
+	esp_deep_sleep_start();
+   
+}
+
+void connectToWiFi() {
+    for (int i = 0; i < numNetworks; i++) {
+        WiFi.begin(ssidList[i], passwordList[i]);
+        Serial.print("Connecting to WiFi...");
+        lcd.print("Connecting to WiFi...");
+
+        int attempt = 0;
+        while (WiFi.status() != WL_CONNECTED && attempt < 10) {
+            delay(1000);
+            Serial.print(".");
+            attempt++;
+        }
+
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("Connected to WiFi");
+            lcd.print("Connected to WiFi");
+            ssid = ssidList[i];
+            password = passwordList[i];
+            break;
+        } else {
+            Serial.println("Connection failed");
+            lcd.print("Connection failed");
+        }
+    }
+}
+// Manesh added to simplify the data calling part 
+void updateScaleData(){
+	
+	for (int i = 1; i < 3; ++i){
+        Serial.println(" ");
+        Serial.println("Sending Data ....... "  + String(i) + " times");
+		    Serial.println(" ");
+        
+		float batteryVoltage = getBatteryVoltage();
+		int batteryPercentage = getBatteryPercentage(batteryVoltage);
+
+        Serial.print("Voltage: ");
+        Serial.print(batteryVoltage);
+        Serial.println(" V");
+        Serial.print("Battery Percentage: ");
+        Serial.print(batteryPercentage);
+        Serial.println(" %");
+
+        Serial.print("one reading:\t");
+        Serial.println(scale.get_units(), 3);
+        float stuffweight = scale.get_units();
+        lcd.clear();
+        unitcount(stuffweight);
+
+        sendDataToServer(batteryPercentage, batteryVoltage, stuffweight);
+		
+		delay(1*5*1000);
+        
+        lcd.clear();
+        Serial.println(" ");
+		Serial.println("Data Sent");
+    }
+	delay(3000);
+	Serial.println("Turn off backlight before Deep Sleep");
+    lcd.noBacklight();		
+}
+
+// Manesh moves Scale initializing part to a separate function
+void initScale(){
+	
+    Serial.println("Initializing the scale");
+    lcd.print("Initializing the scale");
+
+    Serial.println("Scale Original Value  \t\t");
+    Serial.println(scale.get_units(5), 1);
+    delay(5000);
+
+    Serial.println("Before setting up the scale:");
+    Serial.print("read: \t\t");
+    Serial.println(scale.read()); // print a raw reading from the ADC
+
+    Serial.print("read average: \t\t");
+    Serial.println(scale.read_average(20)); // print the average of 20 readings from the ADC
+
+    Serial.print("get value: \t\t");
+    Serial.println(scale.get_value(5)); // print the average of 5 readings from the ADC minus the tare weight (not set yet)
+
+    Serial.print("get units: \t\t");
+    Serial.println(scale.get_units(5), 1);
+    // print the average of 5 readings from the ADC minus tare weight (not set) divided
+    delay(3000); // by the SCALE parameter (not set yet)
+
+    
+    scale.set_scale(dishWeight);
+    delay(3000);
+
+    
+    // scale.set_scale(-471.497);                      // this value is obtained by calibrating the scale with known weights; see the README for details
+    scale.tare(); // reset the scale to 0
+
+    Serial.println("After setting up the scale:");
+    lcd.clear();
+    lcd.print("calibration completed");
+    delay(3000);
+
+    //lcd.clear();
+    //lcd.print("place the  known weights");
+    //Serial.println("zzzzzzzzzzzzzzzzzzzz:");
+    //delay(5000);
+
+    //calibration_factor = scale.get_units(10)/78;
+    //Serial.println("calibration factior");
+    //Serial.println(calibration_factor);
+
+
+    Serial.print("read: \t\t");
+    Serial.println(scale.read()); // print a raw reading from the ADC
+
+    Serial.print("read average: \t\t");
+    Serial.println(scale.read_average(20)); // print the average of 20 readings from the ADC
+
+    Serial.print("get value: \t\t");
+    Serial.println(scale.get_value(5)); // print the average of 5 readings from the ADC minus the tare weight, set with tare()
+
+    Serial.print("get units: \t\t");
+    Serial.println(scale.get_units(5), 1); // print the average of 5 readings from the ADC minus tare weight, divided
+                                           // by the SCALE parameter set with set_scale
+
+	Serial.println("Scale Initializing is completed");
+	lcd.print("Initializing completed");
+	
+}
+
+void intscr()
+{
+    lcd.clear();
+    lcd.setCursor(0, 2);
+}
+
+void getvalscale()
+{
+    if (scale.is_ready())
+    {
+        scale.set_scale();
+        lcd.clear();
+        lcd.print("Scale original val");
+        delay(5000);
+        scale.tare();
+
+        // Serial.println("Tare done...");
+        lcd.clear();
+        lcd.print(" Place a known weight on the scale...");
+
+        delay(5000);
+        long reading = scale.get_units(10);
+        lcd.clear();
+        lcd.print(reading);
+        Serial.print("Result : ");
+        Serial.println(reading);
+        delay(5000);
+    }
+    else
+    {
+        Serial.println("HX711 not found.");
+    }
+}
+
+void unitcount(float wei)
+{
+    lcd.setCursor(0, 0);
+    lcd.print("Count:");
+   // lcd.print((wei / gbl_known_mass), 0);
+    lcd.print((wei / gbl_known_mass) - countAdjustment, 0); // Changed to use countAdjustment
+    lcd.print(" units ");
+}
+
+void sendDataToServer(int percentage, float voltage, float totalmass)
+{
+    float known_mass = gbl_known_mass;
+
+    int count = totalmass / known_mass;
+
+    count = count - countAdjustment;  // This will adjust the count based on fix error
+
+    float totalWeight = known_mass * count;
+
+    Serial.println("known mass .. ");
+    Serial.print(known_mass);
+    Serial.println("totial mass .. ");
+    Serial.print(totalmass);
+    Serial.print("count .. ");
+    Serial.println(count);
+
+  
+   /* // Create an HTTP object (Send the data in server)
+    HTTPClient http;
+
+    // Construct the URL with battery percentage and voltage information
+    String url = String(serverUrl) + "weighingdata/add-data?id=" + String(gbl_device_id) + "&battery_percentage=" + String(percentage) + "&battery_voltage=" + String(voltage) + "&item_count=" + String(count) + "&total_weight=" + String(totalWeight);
+
+    // Make the GET request
+    http.begin(url);
+
+    int httpResponseCode = http.GET();
+
+    // Check the response code
+    if (httpResponseCode > 0)
+    {
+        String jsonResponse = http.getString();
+
+        Serial.println("HTTP Code: " + String(httpResponseCode));
+        Serial.println("Response: " + jsonResponse);
+    }
+    else
+    {
+        Serial.print("Error on sending request. Response code: ");
+        Serial.println(httpResponseCode);
+    }
+
+    // Close connection
+    http.end();
+
+    delay(1000);
+    // Check the count and send a notification for benchmark count
+    if (count < email_notifi_count)
+    {
+
+        sendNotification(percentage, voltage, totalmass, count);
+        delay(2000);
+    }
+
+    // Check the count and send a message for refilling
+    if (count > email_msg_count)
+    {
+        if (refillStatus)
+        {
+            sendMessage();
+
+            // Modify refill status
+            refillStatus = false;
+        }
+        delay(2000);
+    }
+    else
+    {
+        if (!refillStatus)
+        {
+            // Modify refill status
+            refillStatus = true;
+        }
+    }  */                                  //end
+    
+}
+
+// -----------Function that calculates battery voltage-----------
+float getBatteryVoltage()
+{
+    // Read the analog input
+    int sensorValue = analogRead(batteryPin);
+
+    // Convert analog readings to voltage (assuming 3.3V reference for ESP32 ADC)
+    // 4095 = 12-bit resolution of ESP32 ADC
+    // float voltage = sensorValue * ((maxVoltage - minVoltage) / 1024.0) + minVoltage;
+    Serial.println("sensorValue");
+    Serial.println(sensorValue);
+    // float  voltage = (sensorValue * 4.1) / 1023 ;
+
+    float voltage = (maxVoltage / 845) * sensorValue;
+
+    delay(1000);
+
+    return voltage;
+}
+
+int getBatteryPercentage(float voltage)
+{
+
+    if (voltage > maxVoltage)
+    {
+        return 100;
+    }
+    else if ((voltage < 4.1) && (voltage > 3.8))
+    {
+        return 80;
+    }
+    else if ((voltage < 3.8) && (voltage > 3.6))
+    {
+        return 60;
+    }
+    else if ((voltage < 3.6) && (voltage > 3.4))
+    {
+        return 40;
+    }
+    else if ((voltage < 3.4) && (voltage > 3.3))
+    {
+        return 20;
+    }
+    else if (voltage < 3.2)
+    {
+        return 10;
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+// -----------Function that sends the email notification for benchmark count with data-----------
+void sendNotification(int percentage, float voltage, float totalmass, int count)
+{
+
+    float known_mass = gbl_known_mass;
+
+    // int count = totalmass / known_mass ;
+
+    float totalWeight = known_mass * count;
+
+    // Create an HTTP object
+    HTTPClient http;
+
+    // Construct the URL with data for notification
+    String url = String(serverUrl) + "notification/send-notification?id=" + String(gbl_device_id) + "&battery_percentage=" + String(percentage) + "&battery_voltage=" + String(voltage) + "&item_count=" + String(count) + "&total_weight=" + String(totalWeight);
+
+    // Make the GET request
+
+    http.begin(url);
+
+    int httpResponseCode = http.GET();
+
+    // Check the response code
+    if (httpResponseCode > 0)
+    {
+        Serial.print("Notification sent for benchmark count.");
+        String jsonResponse = http.getString();
+
+        Serial.println("HTTP Code: " + String(httpResponseCode));
+        Serial.println("Response: " + jsonResponse);
+    }
+    else
+    {
+        Serial.print("Failed to send the notification for refilling.");
+        Serial.print("Error on sending request. Response code: ");
+        Serial.println(httpResponseCode);
+    }
+
+    // Close connection
+    http.end();
+}
+
+// -----------Function that sends the email message for refilling-----------
+void sendMessage()
+{
+    // Create an HTTP object
+    HTTPClient http;
+
+    // Construct the URL with data for notification
+    String url = String(serverUrl) + "notification/send-message?id=" + String(gbl_device_id);
+
+    // Make the GET request
+
+    http.begin(url);
+
+    int httpResponseCode = http.GET();
+
+    // Check the response code
+    if (httpResponseCode > 0)
+    {
+        Serial.print("Message sent for refilling.");
+        String jsonResponse = http.getString();
+
+        Serial.println("HTTP Code: " + String(httpResponseCode));
+        Serial.println("Response: " + jsonResponse);
+    }
+    else
+    {
+        Serial.print("Failed to send the message for refilling.");
+        Serial.print("Error on sending request. Response code: ");
+        Serial.println(httpResponseCode);
+    }
+
+    // Close connection
+    http.end();
+}
